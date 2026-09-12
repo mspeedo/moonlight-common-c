@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include "FecFrameStats.h"
 
 #include <rs.h>
 
@@ -17,9 +18,28 @@
 // RTP packets use a 90 KHz presentation timestamp clock
 #define PTS_DIVISOR 90
 
+static FEC_FRAME_STATS fecFrameStats;
+
+const FEC_FRAME_STATS* LiGetFecFrameStats(void) {
+    return &fecFrameStats;
+}
+
+static void clearCurrentFrameFecState(PRTP_VIDEO_QUEUE queue) {
+    queue->frameFecEnabled = false;
+    queue->frameFecRecoveryUsed = false;
+}
+
+static void countCurrentFrameFecFailure(PRTP_VIDEO_QUEUE queue) {
+    if (queue->frameFecEnabled) {
+        fecFrameStats.failedFrames++;
+    }
+    clearCurrentFrameFecState(queue);
+}
+
 void RtpvInitializeQueue(PRTP_VIDEO_QUEUE queue) {
     reed_solomon_init();
     memset(queue, 0, sizeof(*queue));
+    memset(&fecFrameStats, 0, sizeof(fecFrameStats));
 
     queue->currentFrameNumber = 1;
     queue->multiFecCapable = APP_VERSION_AT_LEAST(7, 1, 431);
@@ -460,6 +480,10 @@ cleanup:
     if (marks != NULL)
         free(marks);
 
+    if (ret == 0 && queue->bufferDataPackets != queue->receivedDataPackets) {
+        queue->frameFecRecoveryUsed = true;
+    }
+
     return ret;
 }
 
@@ -582,6 +606,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
 #endif
 
     uint32_t fecIndex = (nvPacket->fecInfo & 0x3FF000) >> 12;
+    uint32_t incomingFecPercentage = (nvPacket->fecInfo & 0xFF0) >> 4;
     uint8_t fecCurrentBlockNumber = (nvPacket->multiFecBlocks >> 4) & 0x3;
 
     if (nvPacket->frameIndex == queue->currentFrameNumber && fecCurrentBlockNumber < queue->multiFecCurrentBlockNumber) {
@@ -594,6 +619,10 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
     if (queue->pendingFecBlockList.count == 0 || queue->currentFrameNumber != nvPacket->frameIndex ||
             queue->multiFecCurrentBlockNumber != fecCurrentBlockNumber) {
         if (queue->pendingFecBlockList.count != 0) {
+            // This block/frame is being abandoned. Count one failed FEC frame
+            // regardless of how many multi-FEC blocks were involved.
+            countCurrentFrameFecFailure(queue);
+
             // Report the final status of the FEC queue before dropping this frame
             reportFinalFrameFecStatus(queue);
 
@@ -640,6 +669,16 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
         // or block 0 of a new frame.
         uint8_t expectedFecBlockNumber = (queue->currentFrameNumber == nvPacket->frameIndex ? queue->multiFecCurrentBlockNumber : 0);
         if (fecCurrentBlockNumber != expectedFecBlockNumber) {
+            // If we already started this frame, use its accumulated FEC state.
+            // Otherwise this is the first packet we saw for a frame whose earlier
+            // FEC blocks are entirely missing, so classify it from the incoming header.
+            if (queue->currentFrameNumber == nvPacket->frameIndex && queue->frameFecEnabled) {
+                countCurrentFrameFecFailure(queue);
+            }
+            else if (incomingFecPercentage != 0) {
+                fecFrameStats.failedFrames++;
+            }
+
             // Report the final status of the FEC queue before dropping this frame
             reportFinalFrameFecStatus(queue);
 
@@ -664,6 +703,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
             queue->currentFrameNumber = nvPacket->frameIndex + 1;
             queue->multiFecCurrentBlockNumber = 0;
             queue->reportedLostFrame = false;
+            clearCurrentFrameFecState(queue);
             return RTPF_RET_REJECTED;
         }
 
@@ -707,12 +747,19 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
         queue->useFastQueuePath = true;
         queue->reportedLostFrame = false;
         queue->bufferDataPackets = (nvPacket->fecInfo & 0xFFC00000) >> 22;
-        queue->fecPercentage = (nvPacket->fecInfo & 0xFF0) >> 4;
+        queue->fecPercentage = incomingFecPercentage;
         queue->bufferParityPackets = (queue->bufferDataPackets * queue->fecPercentage + 99) / 100;
         queue->bufferFirstParitySequenceNumber = U16(queue->bufferLowestSequenceNumber + queue->bufferDataPackets);
         queue->bufferHighestSequenceNumber = U16(queue->bufferFirstParitySequenceNumber + queue->bufferParityPackets - 1);
         queue->multiFecCurrentBlockNumber = fecCurrentBlockNumber;
         queue->multiFecLastBlockNumber = (nvPacket->multiFecBlocks >> 6) & 0x3;
+
+        // Block zero starts a new frame-level FEC outcome. Later blocks preserve
+        // recovery state from earlier blocks until the whole frame is delivered.
+        if (fecCurrentBlockNumber == 0) {
+            queue->frameFecEnabled = queue->fecPercentage != 0;
+            queue->frameFecRecoveryUsed = false;
+        }
 
         queue->stats.packetCountVideo += queue->bufferDataPackets;
         queue->stats.packetCountFec += queue->bufferParityPackets;
@@ -799,6 +846,13 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
                 LC_ASSERT(queue->completedFecBlockList.tail == NULL);
                 LC_ASSERT(queue->completedFecBlockList.count == 0);
 
+                // Commit a recovered frame only after all FEC blocks succeeded and
+                // the complete frame was delivered to the depacketizer.
+                if (queue->frameFecRecoveryUsed) {
+                    fecFrameStats.recoveredFrames++;
+                }
+                clearCurrentFrameFecState(queue);
+
                 // Continue to the next frame
                 queue->currentFrameNumber++;
                 queue->multiFecCurrentBlockNumber = 0;
@@ -808,4 +862,3 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
         return RTPF_RET_QUEUED;
     }
 }
-
