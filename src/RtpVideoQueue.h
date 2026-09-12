@@ -44,6 +44,11 @@ typedef struct _RTP_VIDEO_QUEUE {
     uint8_t multiFecCurrentBlockNumber;
     uint8_t multiFecLastBlockNumber;
 
+    // These span all FEC blocks belonging to one video frame. They allow the
+    // stream-health counters to report a frame only once even with multi-FEC.
+    bool frameFecEnabled;
+    bool frameFecRecoveryUsed;
+
     uint64_t lastOosFramePresentationTimestamp;
     bool receivedOosData;
 
