@@ -18,10 +18,28 @@
 // RTP packets use a 90 KHz presentation timestamp clock
 #define PTS_DIVISOR 90
 
-static FEC_FRAME_STATS fecFrameStats;
+#if defined(_MSC_VER) && !defined(__clang__)
+typedef volatile LONG FEC_STATS_ATOMIC;
+#define FEC_STATS_LOAD(value) ((uint32_t)InterlockedCompareExchange((value), 0, 0))
+#define FEC_STATS_STORE(value, newValue) InterlockedExchange((value), (LONG)(newValue))
+#define FEC_STATS_INCREMENT(value) InterlockedIncrement((value))
+#else
+typedef uint32_t FEC_STATS_ATOMIC;
+#define FEC_STATS_LOAD(value) __atomic_load_n((value), __ATOMIC_RELAXED)
+#define FEC_STATS_STORE(value, newValue) __atomic_store_n((value), (newValue), __ATOMIC_RELAXED)
+#define FEC_STATS_INCREMENT(value) __atomic_add_fetch((value), 1, __ATOMIC_RELAXED)
+#endif
 
-const FEC_FRAME_STATS* LiGetFecFrameStats(void) {
-    return &fecFrameStats;
+static FEC_STATS_ATOMIC fecRecoveredFrames;
+static FEC_STATS_ATOMIC fecFailedFrames;
+
+void LiGetFecFrameStats(PFEC_FRAME_STATS stats) {
+    if (stats == NULL) {
+        return;
+    }
+
+    stats->recoveredFrames = FEC_STATS_LOAD(&fecRecoveredFrames);
+    stats->failedFrames = FEC_STATS_LOAD(&fecFailedFrames);
 }
 
 static void clearCurrentFrameFecState(PRTP_VIDEO_QUEUE queue) {
@@ -31,7 +49,7 @@ static void clearCurrentFrameFecState(PRTP_VIDEO_QUEUE queue) {
 
 static void countCurrentFrameFecFailure(PRTP_VIDEO_QUEUE queue) {
     if (queue->frameFecEnabled) {
-        fecFrameStats.failedFrames++;
+        FEC_STATS_INCREMENT(&fecFailedFrames);
     }
     clearCurrentFrameFecState(queue);
 }
@@ -39,7 +57,8 @@ static void countCurrentFrameFecFailure(PRTP_VIDEO_QUEUE queue) {
 void RtpvInitializeQueue(PRTP_VIDEO_QUEUE queue) {
     reed_solomon_init();
     memset(queue, 0, sizeof(*queue));
-    memset(&fecFrameStats, 0, sizeof(fecFrameStats));
+    FEC_STATS_STORE(&fecRecoveredFrames, 0);
+    FEC_STATS_STORE(&fecFailedFrames, 0);
 
     queue->currentFrameNumber = 1;
     queue->multiFecCapable = APP_VERSION_AT_LEAST(7, 1, 431);
@@ -676,7 +695,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
                 countCurrentFrameFecFailure(queue);
             }
             else if (incomingFecPercentage != 0) {
-                fecFrameStats.failedFrames++;
+                FEC_STATS_INCREMENT(&fecFailedFrames);
             }
 
             // Report the final status of the FEC queue before dropping this frame
@@ -849,7 +868,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
                 // Commit a recovered frame only after all FEC blocks succeeded and
                 // the complete frame was delivered to the depacketizer.
                 if (queue->frameFecRecoveryUsed) {
-                    fecFrameStats.recoveredFrames++;
+                    FEC_STATS_INCREMENT(&fecRecoveredFrames);
                 }
                 clearCurrentFrameFecState(queue);
 
