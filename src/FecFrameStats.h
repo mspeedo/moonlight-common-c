@@ -11,11 +11,13 @@ typedef struct _FEC_FRAME_STATS {
     uint32_t failedFrames;
 } FEC_FRAME_STATS, *PFEC_FRAME_STATS;
 
-// Returns stream-lifetime FEC frame effectiveness counters. A recovered frame
-// required FEC reconstruction and was ultimately delivered successfully. A
-// failed frame had FEC enabled but was abandoned as unrecoverable. Completely
-// missing frames that never reach the RTP queue are not FEC failures.
-const FEC_FRAME_STATS* LiGetFecFrameStats(void);
+// Copies stream-lifetime FEC frame effectiveness counters into the caller-owned
+// snapshot. A recovered frame required FEC reconstruction and was ultimately
+// delivered successfully. A failed frame had FEC enabled but was abandoned as
+// unrecoverable. Completely missing frames that never reach the RTP queue are
+// not FEC failures. The snapshot is safe to read from threads other than the RTP
+// receive thread.
+void LiGetFecFrameStats(PFEC_FRAME_STATS stats);
 
 #ifdef __cplusplus
 }
