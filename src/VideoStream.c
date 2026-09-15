@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include "VideoStreamExtensions.h"
 
 #define FIRST_FRAME_MAX 1500
 #define FIRST_FRAME_TIMEOUT_SEC 10
@@ -19,6 +20,7 @@ static PLT_THREAD decoderThread;
 static bool receivedDataFromPeer;
 static uint64_t firstDataTimeMs;
 static bool receivedFullFrame;
+static VIDEO_RECEIVE_THREAD_INIT_CALLBACK videoReceiveThreadInitCallback;
 
 // We can't request an IDR frame until the depacketizer knows
 // that a packet was lost. This timeout bounds the time that
@@ -33,6 +35,10 @@ static bool receivedFullFrame;
 // can smooth over transient pauses in network traffic
 // and subsequent packet/frame bursts that follow.
 #define RTP_RECV_PACKETS_BUFFERED 2048
+
+void LiSetVideoReceiveThreadInitCallback(VIDEO_RECEIVE_THREAD_INIT_CALLBACK callback) {
+    videoReceiveThreadInitCallback = callback;
+}
 
 // Initialize the video stream
 void initializeVideoStream(void) {
@@ -91,6 +97,10 @@ static void VideoReceiveThreadProc(void* context) {
     bool useSelect;
     int waitingForVideoMs;
     bool encrypted;
+
+    if (videoReceiveThreadInitCallback != NULL) {
+        videoReceiveThreadInitCallback();
+    }
 
     encrypted = !!(EncryptionFeaturesEnabled & SS_ENC_VIDEO);
     decryptedSize = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE;
