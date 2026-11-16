@@ -114,8 +114,9 @@ static uint32_t lastSeenFrame;
 static bool stopping;
 static bool disconnectPending;
 static bool encryptedControlStream;
-static bool hdrEnabled;
+static atomic_bool hdrEnabled;
 static SS_HDR_METADATA hdrMetadata;
+static PLT_MUTEX hdrMutex;
 
 static int intervalGoodFrameCount;
 static int intervalTotalFrameCount;
@@ -124,6 +125,9 @@ static int lastIntervalLossPercentage;
 static int lastConnectionStatusUpdate;
 static uint32_t currentEnetSequenceNumber;
 static uint64_t firstFrameTimeMs;
+
+static atomic_uint lastEnetRtt;
+static atomic_uint lastEnetRttVariance;
 
 static LINKED_BLOCKING_QUEUE referenceFrameControlQueue;
 static LINKED_BLOCKING_QUEUE frameFecStatusQueue;
@@ -320,6 +324,7 @@ int initializeControlStream(void) {
     LbqInitializeLinkedBlockingQueue(&frameFecStatusQueue, 8); // Limits number of frame status reports per periodic ping interval
     LbqInitializeLinkedBlockingQueue(&asyncCallbackQueue, 30);
     PltCreateMutex(&enetMutex);
+    PltCreateMutex(&hdrMutex);
 
     encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431);
 
@@ -356,6 +361,9 @@ int initializeControlStream(void) {
         }
     }
 
+    atomic_store_explicit(&lastEnetRtt, 0, memory_order_relaxed);
+    atomic_store_explicit(&lastEnetRttVariance, 0, memory_order_relaxed);
+
     lastGoodFrame = 0;
     lastSeenFrame = 0;
     disconnectPending = false;
@@ -369,7 +377,7 @@ int initializeControlStream(void) {
     usePeriodicPing = APP_VERSION_AT_LEAST(7, 1, 415);
     encryptionCtx = PltCreateCryptoContext(0);
     decryptionCtx = PltCreateCryptoContext(CTRL_CHANNEL_COUNT);
-    hdrEnabled = false;
+    atomic_store_explicit(&hdrEnabled, false, memory_order_relaxed);
     memset(&hdrMetadata, 0, sizeof(hdrMetadata));
 
     return 0;
@@ -395,6 +403,7 @@ void destroyControlStream(void) {
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&frameFecStatusQueue));
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&asyncCallbackQueue));
 
+    PltDeleteMutex(&hdrMutex);
     PltDeleteMutex(&enetMutex);
 }
 
@@ -405,14 +414,17 @@ static void queueFrameInvalidationTuple(uint32_t startFrame, uint32_t endFrame) 
         PQUEUED_REFERENCE_FRAME_CONTROL qfit;
         qfit = malloc(sizeof(*qfit));
         if (qfit != NULL) {
+            int err;
+
             *qfit = (QUEUED_REFERENCE_FRAME_CONTROL){
                 .startFrame = startFrame,
                 .endFrame = endFrame,
                 .invalidate = true,
             };
-            if (LbqOfferQueueItem(&referenceFrameControlQueue, qfit, &qfit->entry) == LBQ_BOUND_EXCEEDED) {
-                // Too many invalidation tuples, so we need an IDR frame now
-                Limelog("RFI range list reached maximum size limit\n");
+
+            err = LbqOfferQueueItem(&referenceFrameControlQueue, qfit, &qfit->entry);
+            if (err != LBQ_SUCCESS) {
+                Limelog("Failed to queue RFI range: %d\n", err);
                 free(qfit);
                 LiRequestIdrFrame();
             }
@@ -452,14 +464,18 @@ void connectionReceivedCompleteFrame(uint32_t frameIndex, bool frameIsLTR) {
         PQUEUED_REFERENCE_FRAME_CONTROL qfit;
         qfit = malloc(sizeof(*qfit));
         if (qfit != NULL) {
+            int err;
+
             *qfit = (QUEUED_REFERENCE_FRAME_CONTROL){
                 .startFrame = frameIndex,
                 .invalidate = false,
             };
-            if (LbqOfferQueueItem(&referenceFrameControlQueue, qfit, &qfit->entry) == LBQ_BOUND_EXCEEDED) {
+
+            err = LbqOfferQueueItem(&referenceFrameControlQueue, qfit, &qfit->entry);
+            if (err != LBQ_SUCCESS) {
                 // This shouldn't happen and indicates that something has gone wrong with the queue
                 LC_ASSERT(false);
-                Limelog("Couldn't queue LTR ACK because the list has reached maximum size limit\n");
+                Limelog("Couldn't queue LTR ACK: %d\n", err);
                 free(qfit);
                 LiRequestIdrFrame();
             }
@@ -477,14 +493,14 @@ void connectionSendFrameFecStatus(PSS_FRAME_FEC_STATUS fecStatus) {
     PQUEUED_FRAME_FEC_STATUS queuedFecStatus = malloc(sizeof(*queuedFecStatus));
     if (queuedFecStatus != NULL) {
         queuedFecStatus->fecStatus = *fecStatus;
-        if (LbqOfferQueueItem(&frameFecStatusQueue, queuedFecStatus, &queuedFecStatus->entry) == LBQ_BOUND_EXCEEDED) {
+        if (LbqOfferQueueItem(&frameFecStatusQueue, queuedFecStatus, &queuedFecStatus->entry) != LBQ_SUCCESS) {
             free(queuedFecStatus);
         }
     }
 }
 
 void connectionSawFrame(uint32_t frameIndex) {
-    LC_ASSERT_VT(!isBefore16(frameIndex, lastSeenFrame));
+    LC_ASSERT_VT(!isBefore32(frameIndex, lastSeenFrame));
 
     uint64_t now = PltGetMillis();
 
@@ -1166,7 +1182,7 @@ static void asyncCallbackThreadFunc(void* context) {
                 queuedCb = nextCb;
             }
 
-            ListenerCallbacks.setHdrMode(hdrEnabled);
+            ListenerCallbacks.setHdrMode(LiGetCurrentHostDisplayHdrMode());
             break;
 
         case IDX_SET_MOTION_EVENT:
@@ -1468,6 +1484,8 @@ static void controlReceiveThreadFunc(void* context) {
 
                 BbInitializeWrappedBuffer(&bb, (char*)ctlHdr, sizeof(*ctlHdr), packetLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
 
+                PltLockMutex(&hdrMutex);
+
                 BbGet8(&bb, &enableByte);
                 if (IS_SUNSHINE()) {
                     // Zero the metadata buffer to properly handle older servers if we have to add new fields
@@ -1487,7 +1505,9 @@ static void controlReceiveThreadFunc(void* context) {
                     BbGet16(&bb, &hdrMetadata.maxFullFrameLuminance);
                 }
 
-                hdrEnabled = (enableByte != 0);
+                atomic_store_explicit(&hdrEnabled, enableByte != 0, memory_order_release);
+
+                PltUnlockMutex(&hdrMutex);
             }
 
             // Process client callbacks in a separate thread
@@ -1923,25 +1943,34 @@ bool isControlDataInTransit(void) {
 }
 
 bool LiGetEstimatedRttInfo(uint32_t* estimatedRtt, uint32_t* estimatedRttVariance) {
-    bool ret = false;
-
-    // We do not acquire enetMutex here because we're just reading metrics
-    // and observing a torn write every once in a while is totally fine.
-    // The peer pointer points to memory reserved inside the client object,
-    // so it's guaranteed that it will never go away underneath us.
-    if (peer != NULL && peer->state == ENET_PEER_STATE_CONNECTED) {
-        if (estimatedRtt != NULL) {
-            *estimatedRtt = peer->roundTripTime;
+    // Opportunistically update the cached RTT stats if nobody is using ENet right now
+    if (PltTryLockMutex(&enetMutex)) {
+        if (peer != NULL && peer->state == ENET_PEER_STATE_CONNECTED) {
+            atomic_store_explicit(&lastEnetRttVariance, peer->roundTripTimeVariance, memory_order_relaxed);
+            atomic_store_explicit(&lastEnetRtt, peer->roundTripTime, memory_order_release);
+        }
+        else {
+            atomic_store_explicit(&lastEnetRttVariance, 0, memory_order_relaxed);
+            atomic_store_explicit(&lastEnetRtt, 0, memory_order_release);
         }
 
-        if (estimatedRttVariance != NULL) {
-            *estimatedRttVariance = peer->roundTripTimeVariance;
-        }
-
-        ret = true;
+        PltUnlockMutex(&enetMutex);
     }
 
-    return ret;
+    // Return the cached values to the caller (if present)
+    uint32_t lastRtt = atomic_load_explicit(&lastEnetRtt, memory_order_acquire);
+    if (lastRtt == 0) {
+        return false;
+    }
+
+    if (estimatedRtt != NULL) {
+        *estimatedRtt = lastRtt;
+    }
+    if (estimatedRttVariance != NULL) {
+        *estimatedRttVariance = atomic_load_explicit(&lastEnetRttVariance, memory_order_relaxed);
+    }
+
+    return true;
 }
 
 // Starts the control stream
@@ -2271,14 +2300,24 @@ int startControlStream(void) {
 }
 
 bool LiGetCurrentHostDisplayHdrMode(void) {
-    return hdrEnabled;
+    return atomic_load_explicit(&hdrEnabled, memory_order_acquire);
 }
 
 bool LiGetHdrMetadata(PSS_HDR_METADATA metadata) {
-    if (!IS_SUNSHINE() || !hdrEnabled) {
+    if (!IS_SUNSHINE() || !atomic_load_explicit(&hdrEnabled, memory_order_acquire)) {
+        return false;
+    }
+
+    PltLockMutex(&hdrMutex);
+
+    // Check again inside the lock to make sure HDR is still enabled
+    if (!atomic_load_explicit(&hdrEnabled, memory_order_relaxed)) {
+        PltUnlockMutex(&hdrMutex);
         return false;
     }
 
     *metadata = hdrMetadata;
+    PltUnlockMutex(&hdrMutex);
+
     return true;
 }
